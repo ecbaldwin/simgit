@@ -225,7 +225,10 @@ class Color(object):
         return self.__class__(r=new_r, g=new_g, b=new_b)
 
 
-def dfs_visit(branches, visit_ancestors=True, visit_replaces=False):
+def dfs_visit(branches, visit_parents=True, visit_ancestors=False, visit_replaces=False):
+    if not isinstance(branches, list):
+        branches = [branches]
+
     seen = set()
     def visit(commit):
         if commit.sha1 in seen:
@@ -235,7 +238,9 @@ def dfs_visit(branches, visit_ancestors=True, visit_replaces=False):
         if visit_ancestors:
             for parent in commit.ancestors:
                 branches.append(parent)
-        parents = sorted(commit.parents, key=lambda c: c.branch_num)
+        parents = []
+        if visit_parents:
+            parents += sorted(commit.parents, key=lambda c: c.branch_num)
         if visit_replaces:
             parents += commit.replaces
         for parent in parents:
@@ -249,10 +254,6 @@ def dfs_visit(branches, visit_ancestors=True, visit_replaces=False):
         branches = branches[1:]
         for commit in visit(branch.commitish()):
             yield commit
-
-
-def dfs_visit_branches(branches):
-    return dfs_visit(branches, visit_ancestors=False)
 
 
 class Branch(Commitish):
@@ -323,7 +324,7 @@ class Branch(Commitish):
         # See if fast-forward is possible
         if len(others) == 1:
             other = others[0]
-            for commit in dfs_visit_branches([other]):
+            for commit in dfs_visit(other):
                 if commit == self.commitish():
                     # If you want the commit to show up on the master lane in
                     # gray, uncomment this.
@@ -353,12 +354,12 @@ class Branch(Commitish):
 
         # Mark the commits reachable from the other branch
         seen = set()
-        for commit in dfs_visit_branches([other.commitish()]):
+        for commit in dfs_visit(other.commitish()):
             seen.add(commit.sha1)
 
         # List the commits that aren't on the other branch
         to_rebase = []
-        for commit in dfs_visit_branches([old]):
+        for commit in dfs_visit(old):
             if commit.sha1 in seen:
                 continue
             if commit.sha1 not in fixups:
@@ -373,6 +374,16 @@ class Branch(Commitish):
     def fixup_rebase(self, original, fixup):
         self.rebase(original.parents[0], fixups={fixup.sha1})
 
+    # This is almost the same as the other one.
+    def replay_merge(self, commits):
+        if self._head:
+            parents = [self._head]
+        else:
+            parents = []
+        replayed = Commit.Replay(parents=parents, replaces=commits, branch=self, commit=commits[0])
+        self._head = replayed
+        return replayed
+
     def replay_commit(self, commit):
         if self._head:
             parents = [self._head]
@@ -382,7 +393,14 @@ class Branch(Commitish):
         self._head = replayed
         return replayed
 
-    def replay(self, other, fixups=None, modify=False):
+    def replay_amend(self):
+        old = self.commitish()
+        replayed = Commit.Replay(parents=old.parents, replaces=[old], branch=self, commit=old)
+        self._head = replayed
+        replayed.add_ancestor(old)
+
+    def replay(self, other, fixups=None):
+        # Replay has a direction. Always replay downstream onto upstream.
         if other in self._downstreams:
             other.replay(self)
             # Accessing the private _color attr. I know.
@@ -390,36 +408,70 @@ class Branch(Commitish):
             self.reset(other)
             return self.commitish()
 
-        if fixups is None:
-            fixups = {}
-        if not isinstance(other, Commitish):
-            raise Exception("Replaying to something that isn't like a commit")
+        # Check if this is a fast-forward situation.
+        for commit in dfs_visit(self.commitish()):
+            if commit == other.commitish():
+                if not fixups:
+                    return
 
-        if not modify:
-            for commit in dfs_visit_branches([self.commitish()]):
-                if commit == other.commitish():
-                    if not fixups:
-                        return
+        other_commits = {c for c in dfs_visit(other.commitish())}
+        my_commits = {c for c in dfs_visit(self.commitish())}
+        common_commits = other_commits & my_commits
 
-        # Mark the commits reachable from the other branch
-        seen = set()
-        for commit in dfs_visit_branches([other.commitish()]):
-            seen.add(commit.sha1)
+        # Map each commit to all old revisions of it by following only replaces pointers
+        revisions = collections.defaultdict(set)
+        for commit in (other_commits|my_commits) - common_commits:
+            if len(commit.replaces) > 1:
+                raise Exception("I don't know how to handle multiple replaces pointers yet")
+            for revision in dfs_visit(commit, visit_replaces=True, visit_parents=False):
+                if len(revisions[revision]):
+                    continue
+                if len(revision.replaces):
+                    # Pull the set from the old revision to this one.
+                    # When we're finished the set will have all of the revisions of any given commit.
+                    revisions[revision] = revisions[revision.replaces[0]]
+                revisions[revision].add(revision)
 
+        # Basically, fixups just get dropped for now.
+        skip_commits = other_commits | set(fixups or [])
+        to_replay = [c for c in dfs_visit(self.commitish())
+                     if c not in skip_commits]
+
+        # TODO Gotta find matches based on common old revisions found in the previous step.
+
+        # Reset the branch to the other to begin replaying commits onto it.
         old = self.commitish()
         self.reset(other)
 
-        # List the commits that aren't on the other branch
-        to_rebase = []
-        for commit in dfs_visit_branches([old]):
-            if commit.sha1 in seen:
+        # First, play the upstream commits
+        # Until we have to create a new commit, we can just fast-forward through these
+        merged = set()
+        fast_forward = True
+        for commit in dfs_visit(other.commitish()):
+            if commit in common_commits:
                 continue
-            if commit not in fixups:
-                to_rebase.append(commit)
 
-        mapping = {}
-        for commit in to_rebase:
-            mapping[commit] = self.replay_commit(commit)
+            all_revs = revisions[commit]
+            merge_set = all_revs & my_commits
+            if merge_set:
+                if len(merge_set) > 1:
+                    raise Exception("There shouldn't be two old revisions of this commit in this branch")
+                fast_forward = False
+                merge = merge_set.pop()
+                merged.add(merge)
+                self.replay_merge([commit, merge])
+                continue
+
+            if fast_forward:
+                self.reset(commit)
+                continue
+
+            self.replay_commit(commit)
+
+        for commit in to_replay:
+            if commit in merged:
+                continue
+            self.replay_commit(commit)
 
         self.commitish().add_ancestor(old)
         return self.commitish()
@@ -452,7 +504,7 @@ class Repository(object):
         # appear below active branches.
         lane = 1
         last_commit = None
-        for commit in self.dfs_visit():
+        for commit in self.dfs_visit(visit_ancestors=True):
             if not commit.parents:
                 commit.y = lane
             else:
@@ -468,7 +520,7 @@ class Repository(object):
             last_commit = commit
 
         # Now with the branches
-        for commit in self.dfs_visit(visit_replaces=True):
+        for commit in self.dfs_visit(visit_ancestors=True, visit_replaces=True):
             if not commit.parents:
                 commit.x = 1
             else:
@@ -502,9 +554,9 @@ class Repository(object):
                 "style": "vector-effect: non-scaling-stroke;",
             }
             active = {c for c in dfs_visit(
-                self._branches.values(), visit_ancestors=False, visit_replaces=True)}
+                self._branches.values(), visit_replaces=True)}
 
-            for commit in self.dfs_visit():
+            for commit in self.dfs_visit(visit_ancestors=True):
                 for parent in commit.parents:
                     with svg.child("path") as line:
                         line.attrs = {
@@ -531,7 +583,7 @@ class Repository(object):
                             "fill": "none",
                         }
 
-            for commit in self.dfs_visit():
+            for commit in self.dfs_visit(visit_ancestors=True):
                 with svg.child("circle") as circle:
                     circle.attrs = {
                         "id": "commit-" + commit.sha1,
@@ -551,5 +603,8 @@ class Repository(object):
 
         xml.render()
 
-    def dfs_visit(self, visit_replaces=False):
-        return dfs_visit(self._branches.values(), visit_replaces=visit_replaces)
+    def dfs_visit(self, visit_parents=True, visit_ancestors=True, visit_replaces=False):
+        return dfs_visit(self._branches.values(),
+                         visit_parents=visit_parents,
+                         visit_ancestors=visit_ancestors,
+                         visit_replaces=visit_replaces)
