@@ -568,7 +568,7 @@ class Repository(object):
 
         return grid
 
-    def render(self):
+    def render(self, active_branches=None):
         xml = XmlDoc()
         grid = self.place()
         with xml.root(name='svg') as svg:
@@ -582,10 +582,24 @@ class Repository(object):
                 "stroke": "null",
                 "style": "vector-effect: non-scaling-stroke;",
             }
-            active = {c for c in dfs_visit(
-                self._branches.values(), visit_replaces=True)}
+            if not active_branches:
+                active_branches = self._branches.values()
+            active = {c for c in dfs_visit(active_branches)}
 
             for commit in self.dfs_visit(visit_ancestors=True):
+                for parent in commit.replaces:
+                    with svg.child("path") as line:
+                        line.attrs = {
+                            "id": "%s-%s" % (parent.sha1, commit.sha1),
+                            "stroke": parent.color.lighten() if parent not in active else parent.color,
+                            "d": "M%s,%s C%s,%s %s,%s %s,%s" % (60 * parent.x, 60 * parent.y,
+                                                                60 * commit.x, 60 * (parent.y + commit.y)/2,
+                                                                60 * parent.x, 60 * (parent.y + commit.y)/2,
+                                                                60 * commit.x, 60 * commit.y),
+                            "stroke-width": "8",
+                            "stroke-dasharray": "5, 5",
+                            "fill": "none",
+                        }
                 for parent in commit.parents:
                     with svg.child("path") as line:
                         line.attrs = {
@@ -596,19 +610,6 @@ class Repository(object):
                                                                 60 * parent.x, 60 * (parent.y + commit.y)/2,
                                                                 60 * commit.x, 60 * commit.y),
                             "stroke-width": "8",
-                            "fill": "none",
-                        }
-                for parent in commit.replaces:
-                    with svg.child("path") as line:
-                        line.attrs = {
-                            "id": "%s-%s" % (parent.sha1, commit.sha1),
-                            "stroke": parent.color.lighten() if commit not in active else parent.color,
-                            "d": "M%s,%s C%s,%s %s,%s %s,%s" % (60 * parent.x, 60 * parent.y,
-                                                                60 * commit.x, 60 * (parent.y + commit.y)/2,
-                                                                60 * parent.x, 60 * (parent.y + commit.y)/2,
-                                                                60 * commit.x, 60 * commit.y),
-                            "stroke-width": "8",
-                            "stroke-dasharray": "5, 5",
                             "fill": "none",
                         }
 
