@@ -399,22 +399,28 @@ class Branch(Commitish):
         self._head = replayed
         replayed.add_ancestor(old)
 
-    def replay(self, other, fixups=None):
+    def replay_squash(self, other, message):
+        self.replay(other, squash=True)
+        self.commitish()._message = message
+
+    def replay(self, other, fixups=None, squash=False):
         # Replay has a direction. Always replay downstream onto upstream.
         if other in self._downstreams:
             old = self.commitish()
             self.reset(other)
-            self.replay(old)
+            # TODO Pass fixups?
+            self.replay(old, squash=squash)
             # Accessing the private _color attr. I know.
             # self.commitish()._color = self.color
             self.commitish().add_ancestor(old)
             return self.commitish()
 
         # Check if this is a fast-forward situation.
-        for commit in dfs_visit(self.commitish()):
-            if commit == other.commitish():
-                if not fixups:
-                    return
+        if not squash:
+            for commit in dfs_visit(self.commitish()):
+                if commit == other.commitish():
+                    if not fixups:
+                        return
 
         other_commits = {c for c in dfs_visit(other.commitish())}
         my_commits = {c for c in dfs_visit(self.commitish())}
@@ -446,6 +452,16 @@ class Branch(Commitish):
         # Until we have to create a new commit, we can just fast-forward through these
         seen = set()
         fast_forward = True
+
+        squash_replaces = []
+        def reset_or_replay(commit):
+            if fast_forward or squash:
+                self.reset(commit)
+                if squash:
+                    squash_replaces.append(commit)
+                return
+            self.replay_commit(commit)
+
         for commit in dfs_visit(other.commitish()):
             if commit in common_commits:
                 continue
@@ -455,11 +471,7 @@ class Branch(Commitish):
             all_revs = revisions[commit]
             same_change_set = all_revs & my_commits
             if not same_change_set:
-                if fast_forward:
-                    self.reset(commit)
-                    continue
-
-                self.replay_commit(commit)
+                reset_or_replay(commit)
                 continue
 
             if len(same_change_set) > 1:
@@ -470,23 +482,18 @@ class Branch(Commitish):
             # See if the downstream is reachable from the upstream
             for c in dfs_visit(commit, visit_replaces=True, visit_parents=False):
                 if c == other_rev:
-                    if fast_forward:
-                        self.reset(commit)
-                        break
-                    self.replay_commit(commit)
+                    reset_or_replay(commit)
                     break
             else:
                 # See if the upstream is reachable from the downstream
                 for c in dfs_visit(other_rev, visit_replaces=True, visit_parents=False):
                     if c == commit:
-                        if fast_forward:
-                            self.reset(other_rev)
-                            break
-                        self.replay_commit(other_rev)
+                        reset_or_replay(other_rev)
                         break
                 else:
                     # Neither is reachable from the other. Merge them.
                     fast_forward = False
+                    # TODO DO something for replay_squash here
                     self.replay_merge([commit, other_rev])
 
         for commit in to_replay:
@@ -497,11 +504,14 @@ class Branch(Commitish):
                     fast_forward = False
                 if commit in originals:
                     fast_forward = False
-            if fast_forward:
-                self.reset(commit)
-                continue
-            self.replay_commit(commit)
+            reset_or_replay(commit)
 
+        if squash:
+            replayed = Commit.Replay(parents=[other.commitish()],
+                                     replaces=squash_replaces,
+                                     branch=self,
+                                     commit=old)
+            self.reset(replayed)
         self.commitish().add_ancestor(old)
         return self.commitish()
 
