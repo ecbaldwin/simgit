@@ -402,10 +402,12 @@ class Branch(Commitish):
     def replay(self, other, fixups=None):
         # Replay has a direction. Always replay downstream onto upstream.
         if other in self._downstreams:
-            other.replay(self)
-            # Accessing the private _color attr. I know.
-            other.commitish()._color = self.color
+            old = self.commitish()
             self.reset(other)
+            self.replay(old)
+            # Accessing the private _color attr. I know.
+            # self.commitish()._color = self.color
+            self.commitish().add_ancestor(old)
             return self.commitish()
 
         # Check if this is a fast-forward situation.
@@ -421,8 +423,6 @@ class Branch(Commitish):
         # Map each commit to all old revisions of it by following only replaces pointers
         revisions = collections.defaultdict(set)
         for commit in (other_commits|my_commits) - common_commits:
-            if len(commit.replaces) > 1:
-                raise Exception("I don't know how to handle multiple replaces pointers yet")
             for revision in dfs_visit(commit, visit_replaces=True, visit_parents=False):
                 if len(revisions[revision]):
                     continue
@@ -434,10 +434,9 @@ class Branch(Commitish):
 
         # Basically, fixups just get dropped for now.
         skip_commits = other_commits | set(fixups or [])
+        originals = set(fixups.values()) if fixups else set()
         to_replay = [c for c in dfs_visit(self.commitish())
                      if c not in skip_commits]
-
-        # TODO Gotta find matches based on common old revisions found in the previous step.
 
         # Reset the branch to the other to begin replaying commits onto it.
         old = self.commitish()
@@ -445,31 +444,61 @@ class Branch(Commitish):
 
         # First, play the upstream commits
         # Until we have to create a new commit, we can just fast-forward through these
-        merged = set()
+        seen = set()
         fast_forward = True
         for commit in dfs_visit(other.commitish()):
             if commit in common_commits:
                 continue
 
+            seen.add(commit)
+
             all_revs = revisions[commit]
-            merge_set = all_revs & my_commits
-            if merge_set:
-                if len(merge_set) > 1:
-                    raise Exception("There shouldn't be two old revisions of this commit in this branch")
-                fast_forward = False
-                merge = merge_set.pop()
-                merged.add(merge)
-                self.replay_merge([commit, merge])
+            same_change_set = all_revs & my_commits
+            if not same_change_set:
+                if fast_forward:
+                    self.reset(commit)
+                    continue
+
+                self.replay_commit(commit)
                 continue
 
-            if fast_forward:
-                self.reset(commit)
-                continue
+            if len(same_change_set) > 1:
+                raise Exception("There shouldn't be two old revisions of this change in a branch")
+            other_rev = same_change_set.pop()
+            seen.add(other_rev)
 
-            self.replay_commit(commit)
+            # See if the downstream is reachable from the upstream
+            for c in dfs_visit(commit, visit_replaces=True, visit_parents=False):
+                if c == other_rev:
+                    if fast_forward:
+                        self.reset(commit)
+                        break
+                    self.replay_commit(commit)
+                    break
+            else:
+                # See if the upstream is reachable from the downstream
+                for c in dfs_visit(other_rev, visit_replaces=True, visit_parents=False):
+                    if c == commit:
+                        if fast_forward:
+                            self.reset(other_rev)
+                            break
+                        self.replay_commit(other_rev)
+                        break
+                else:
+                    # Neither is reachable from the other. Merge them.
+                    fast_forward = False
+                    self.replay_merge([commit, other_rev])
 
         for commit in to_replay:
-            if commit in merged:
+            if commit in seen:
+                continue
+            if fast_forward:
+                if self.commitish() not in commit.parents:
+                    fast_forward = False
+                if commit in originals:
+                    fast_forward = False
+            if fast_forward:
+                self.reset(commit)
                 continue
             self.replay_commit(commit)
 
@@ -528,7 +557,7 @@ class Repository(object):
                 # Take the next spot in the same lane
                 commit.x = minimum_x
             grid[commit.y][commit.x] = commit
-            print("Placing %s at %d,%d" % (commit.sha1, commit.x, commit.y), file=sys.stderr)
+            print("Placing %s at %s,%s" % (commit.sha1, commit.x, commit.y), file=sys.stderr)
             for parent in commit.parents:
                 parent.max_x = min(commit.x-1, parent.max_x)
             # Try to pull parents closer if possible
